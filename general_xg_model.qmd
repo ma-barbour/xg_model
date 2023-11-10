@@ -609,7 +609,7 @@ Zoom in on cross-ice plays under 40 feet.
 
 ```{r}
 
-pbp_data %>% mutate(lag_zone = lag(zone)) %>% mutate(y_diff = abs(event_y) + abs(lag(event_y))) %>% mutate(elapsed_time = period_time_s - lag(period_time_s)) %>% filter(period != 5, event_type == "goal", lag_zone == "O", y_diff < 40, elapsed_time >= 0 & elapsed_time < 4) %>% ggplot() + geom_histogram(aes(y_diff), binwidth = 1) + theme_minimal() + labs(y = "Goals", x = "Cross Ice Distance")
+pbp_data %>% mutate(lag_zone = lag(zone)) %>% mutate(y_diff = case_when(event_y >= 0 & lag(event_y >= 0) ~ abs(event_y - lag(event_y)), event_y < 0 & lag(event_y < 0) ~ abs(event_y - lag(event_y)), event_y >= 0 & lag(event_y) < 0 ~ event_y + abs(lag(event_y)), lag(event_y) >=0 & event_y < 0 ~ abs(event_y) + lag(event_y))) %>% mutate(elapsed_time = period_time_s - lag(period_time_s)) %>% filter(period != 5, event_type == "goal", lag_zone == "O", y_diff < 40, elapsed_time >= 0 & elapsed_time < 4) %>% ggplot() + geom_histogram(aes(y_diff), binwidth = 1) + theme_minimal() + labs(y = "Goals", x = "Cross Ice Distance")
 
 ```
 
@@ -617,14 +617,150 @@ pbp_data %>% mutate(lag_zone = lag(zone)) %>% mutate(y_diff = abs(event_y) + abs
 
 ```{r}
 
-pbp_data %>% mutate(lag_zone = lag(zone)) %>% mutate(y_diff = abs(event_y) + abs(lag(event_y))) %>% mutate(elapsed_time = period_time_s - lag(period_time_s)) %>% mutate(lag_event = lag(event_type)) %>% filter(period != 5, event_type == "goal", lag_zone == "O", y_diff < 40, lag_event == "shot-on-goal", elapsed_time >= 0 & elapsed_time < 3) %>% ggplot() + geom_histogram(aes(y_diff), binwidth = 1) + theme_minimal() + labs(y = "Goals On Rebounds", x = "Cross Ice Distance")
+pbp_data %>% mutate(lag_zone = lag(zone)) %>% mutate(y_diff = case_when(event_y >= 0 & lag(event_y >= 0) ~ abs(event_y - lag(event_y)), event_y < 0 & lag(event_y < 0) ~ abs(event_y - lag(event_y)), event_y >= 0 & lag(event_y) < 0 ~ event_y + abs(lag(event_y)), lag(event_y) >=0 & event_y < 0 ~ abs(event_y) + lag(event_y))) %>% mutate(elapsed_time = period_time_s - lag(period_time_s)) %>% mutate(lag_event = lag(event_type)) %>% filter(period != 5, event_type == "goal", lag_zone == "O", y_diff < 40, lag_event == "shot-on-goal", elapsed_time >= 0 & elapsed_time < 3) %>% ggplot() + geom_histogram(aes(y_diff), binwidth = 1) + theme_minimal() + labs(y = "Goals On Rebounds", x = "Cross Ice Distance")
 
 ```
 
-## Missed Shot Percentages By Skater
+### Missed Shot Percentages By Skater
 
 ```{r}
 
 pbp_data %>% filter(period != 5, event_type == "goal" | event_type == "shot-on-goal" | event_type == "missed-shot") %>% group_by(shooter_id) %>% summarise(shots = n(), missed = sum(event_type == "missed-shot")) %>% mutate(miss_percentage = round(((missed / shots) * 100), 1)) %>% filter(shots > 500) %>% ggplot() + geom_histogram(aes(miss_percentage), binwidth = 1) + theme_minimal() + labs(y = "Skater Count (Minimum 500 Shots)", x = "Missed Shot Percentage")
+
+```
+
+## Build The xG Model
+
+### Split The Data
+
+```{r}
+
+set.seed(18)
+
+split_data <- initial_split(data = pbp_data)
+
+training_data <- training(split_data)
+testing_data <- testing(split_data)
+
+```
+
+### Define The Model
+
+```{r}
+
+xgb_model <- boost_tree(#trees = tune(),
+                        #tree_depth = tune(),
+                        #mtry = tune(),
+                        #min_n = tune(),
+                        #sample_size = tune()
+        ) %>%
+        set_engine("xgboost") %>%
+        set_mode("classification") 
+
+```
+
+### Write A Recipe
+
+```{r}
+
+xgb_recipe <- recipe(event_type ~ .,
+                     data = training_data) %>%
+        step_mutate(lag_event = lag(event_type),
+                    lag_zone = lag(zone),
+                    elapsed_time = period_time_s - lag(period_time_s),
+                    y_diff = case_when(
+                            event_y >= 0 & lag(event_y >= 0) ~ abs(event_y - lag(event_y)), 
+                            event_y < 0 & lag(event_y < 0) ~ abs(event_y - lag(event_y)), 
+                            event_y >= 0 & lag(event_y) < 0 ~ event_y + abs(lag(event_y)), 
+                            event_y < 0 & lag(event_y) >=0 ~ abs(event_y) + lag(event_y)),
+                    period = as.factor(period),
+                    event_pp = as.factor(event_pp),
+                    event_sh = as.factor(event_sh)) %>%
+        step_mutate(shot_type = if_else(is.na(shot_type), "unknown", shot_type),
+                    lag_event = if_else(is.na(lag_event), "unknown", lag_event),
+                    lag_zone = if_else(is.na(lag_zone), "unknown", lag_zone),
+                    elapsed_time = if_else(is.na(elapsed_time), 0, elapsed_time),
+                    y_diff = if_else(is.na(y_diff), 0, y_diff)) %>%
+        step_mutate(lag_zone = as.factor(lag_zone)) %>%
+        step_other(shot_type, 
+                   threshold = 0.05, 
+                   id = "st_id") %>%
+        step_other(lag_event, 
+                   threshold = 0.1, 
+                   id = "le_id") %>%
+        step_filter(event_type == "goal" | event_type == "shot-on-goal",
+                    event_on_en == "FALSE",
+                    period != 5) %>%
+        step_select(event_type,
+                    sa_distance,
+                    sa_angle,
+                    shot_type,
+                    period,
+                    event_pp,
+                    event_sh,
+                    lag_event,
+                    lag_zone,
+                    elapsed_time,
+                    y_diff) %>%
+        step_dummy(event_type,
+                   shot_type,
+                   period,
+                   event_pp,
+                   event_sh,
+                   lag_event,
+                   lag_zone,
+                   one_hot = TRUE) 
+
+#%>%
+#step_interact(terms = ~ starts_with(event_type):y_diff:elapsed_time,
+#keep_original_cols = TRUE)
+
+```
+
+### Create A Workflow
+
+```{r}
+
+xgb_wflow <- workflow() %>%
+        add_model(xgb_model) %>%
+        add_recipe(xgb_recipe)
+
+```
+
+### Tune The Model
+
+```{r}
+
+set.seed(18)
+
+xgb_folds <- vfold_cv(training_data,
+                      strata = event_type)
+
+xgb_grid <- grid_latin_hypercube(trees(),
+                                 tree_depth(),
+                                 finalize(mtry(), data_train),
+                                 min_n(),
+                                 sample_size = sample_prop(),
+                                 size = 50)
+
+registerDoParallel()
+
+set.seed(18)
+
+xgb_tuned <- tune_race_anova(xgb_wflow,
+                             resamples = xgb_folds,
+                             grid = xgb_grid)
+
+show_best <- show_best(xgb_tuned,
+                       metric = "roc_auc")
+
+```
+
+### Finalize The Model
+
+```{r}
+
+xgb_fit <- xgb_wflow %>%
+        fit(training_data)
 
 ```
