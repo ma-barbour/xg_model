@@ -8,7 +8,7 @@ editor: visual
 
 ## Introduction
 
-This is an all-purpose expected goals model built using XGBoost.
+This is an expected goals model built using XGBoost.
 
 ## Basic Setup
 
@@ -618,5 +618,13 @@ pbp_data %>% mutate(lag_zone = lag(zone)) %>% mutate(y_diff = abs(event_y) + abs
 ```{r}
 
 pbp_data %>% mutate(lag_zone = lag(zone)) %>% mutate(y_diff = abs(event_y) + abs(lag(event_y))) %>% mutate(elapsed_time = period_time_s - lag(period_time_s)) %>% mutate(lag_event = lag(event_type)) %>% filter(period != 5, event_type == "goal", lag_zone == "O", y_diff < 40, lag_event == "shot-on-goal", elapsed_time >= 0 & elapsed_time < 3) %>% ggplot() + geom_histogram(aes(y_diff), binwidth = 1) + theme_minimal() + labs(y = "Goals On Rebounds", x = "Cross Ice Distance")
+
+```
+
+## Missed Shot Percentages By Skater
+
+```{r}
+
+pbp_data %>% filter(period != 5, event_type == "goal" | event_type == "shot-on-goal" | event_type == "missed-shot") %>% group_by(shooter_id) %>% summarise(shots = n(), missed = sum(event_type == "missed-shot")) %>% mutate(miss_percentage = round(((missed / shots) * 100), 1)) %>% filter(shots > 500) %>% ggplot() + geom_histogram(aes(miss_percentage), binwidth = 1) + theme_minimal() + labs(y = "Skater Count (Minimum 500 Shots)", x = "Missed Shot Percentage")
 
 ```
