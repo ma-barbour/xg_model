@@ -644,20 +644,6 @@ testing_data <- testing(split_data)
 
 ```
 
-### Define The Model
-
-```{r}
-
-xgb_model <- boost_tree(trees = tune(),
-                        tree_depth = tune(),
-                        mtry = tune(),
-                        min_n = tune(),
-                        sample_size = tune()) %>%
-        set_engine("xgboost") %>%
-        set_mode("classification") 
-
-```
-
 ### Pre-Processes The Training Data
 
 ```{r}
@@ -699,86 +685,7 @@ training_data_pp <- training_data %>%
                
 ```
 
-### Write A Recipe
-
-```{r}
-
-xgb_recipe <- recipe(event_type ~ .,
-                     data = training_data_pp) %>%
-        step_rm(temp_id) %>%
-        step_other(shot_type, 
-                   threshold = 0.05, 
-                   id = "st_id") %>%
-        step_other(lag_event, 
-                   threshold = 0.1, 
-                   id = "le_id") %>%
-        step_dummy(all_nominal_predictors(),
-                   one_hot = TRUE) 
-
-```
-
-### Create A Workflow
-
-```{r}
-
-xgb_wflow <- workflow() %>%
-        add_model(xgb_model) %>%
-        add_recipe(xgb_recipe)
-
-```
-
-### Tune The Model
-
-```{r}
-
-set.seed(18)
-
-xgb_folds <- vfold_cv(training_data_pp,
-                      strata = event_type)
-
-xgb_grid <- grid_latin_hypercube(trees(range = c(250, 2000)),
-                                 tree_depth(range = c(1, 2)),
-                                 finalize(mtry(), training_data_pp),
-                                 min_n(range = c(10, 20)),
-                                 sample_size = sample_prop(range = c(0.3, 0.9)),
-                                 size = 50)
-
-registerDoParallel()
-
-set.seed(18)
-
-xgb_tuned <- tune_race_anova(xgb_wflow,
-                             resamples = xgb_folds,
-                             grid = xgb_grid)
-
-show_best <- show_best(xgb_tuned,
-                       metric = "roc_auc")
-
-show_best
-
-```
-
-### Fit The Model
-
-```{r}
-
-xgb_tuned_best <- tibble(trees = show_best$trees[1],
-                         mtry = show_best$mtry[1],
-                         min_n = show_best$min_n[1],
-                         tree_depth = show_best$tree_depth[1],
-                         sample_size = show_best$sample_size[1])
-
-xgb_wflow_final <- xgb_wflow %>%
-        finalize_workflow(xgb_tuned_best)
-
-xgb_fit <- xgb_wflow_final %>%
-        fit(training_data_pp)
-
-```
-
-## Evaluate The Model
-
-### Pre-Process Testing Data
+### Pre-Processes The Testing Data
 
 ```{r}
 
@@ -816,16 +723,255 @@ testing_data_pp <- testing_data %>%
                elapsed_time,
                y_diff,
                temp_id)
-
+               
 ```
+
+### Simple Model
+
+#### Define The Model
 
 ```{r}
 
-xgoals_test_res <- predict(xgb_fit, 
+xgb_model_simple <- boost_tree() %>%
+        set_engine("xgboost") %>%
+        set_mode("classification") 
+
+```
+
+#### Write A Recipe
+
+```{r}
+
+xgb_recipe_simple <- recipe(event_type ~ .,
+                            data = training_data_pp) %>%
+        step_rm(temp_id) %>%
+        step_other(shot_type, 
+                   threshold = 0.05, 
+                   id = "st_id") %>%
+        step_other(lag_event, 
+                   threshold = 0.05, 
+                   id = "le_id") %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+```
+
+#### Create A Workflow
+
+```{r}
+
+xgb_wflow_simple <- workflow() %>%
+        add_model(xgb_model_simple) %>%
+        add_recipe(xgb_recipe_simple)
+
+```
+
+#### Fit The Model
+
+```{r}
+
+xgb_fit_simple <- xgb_wflow_simple %>% 
+        fit(training_data_pp)
+
+```
+
+#### Check AUC With Training Data
+
+```{r}
+
+simple_train_res <- augment(xgb_fit_simple, training_data_pp) %>%
+        roc_auc(event_type, .pred_goal) %>%
+        select(.estimate) %>%
+        rename(auc_simple_training = .estimate)
+
+simple_train_res 
+
+```
+
+#### Check AUC With Testing Data
+
+```{r}
+
+simple_test_res <- predict(xgb_fit_simple, 
                            new_data = testing_data_pp %>% select(-event_type),
                            type = "prob")
 
-xgoals_test_res <- bind_cols(xgoals_test_res, 
+simple_test_res <- bind_cols(simple_test_res, 
                              testing_data_pp %>% select(event_type))
+
+simple_auc <- roc_auc(simple_test_res, event_type, .pred_goal)[3] %>%
+        rename(auc_simple_testing = .estimate)
+
+simple_auc
+
+```
+
+#### Actual v Predicted Goals
+
+```{r}
+
+simple_a_v_p <- summarize(simple_test_res,
+                          actual_goals = sum(event_type == "goal"),
+                          predicted_goals = sum(.pred_goal),
+                          diff = round(predicted_goals - actual_goals, 1),
+                          diff_perc = round((diff / actual_goals), 3) * 100)
+
+simple_a_v_p
+
+```
+
+#### Importance Of Variables
+
+```{r}
+
+extract_fit_parsnip(xgb_fit_simple) %>%
+        vip(num_features = 20)
+
+```
+
+### Tuned Model
+
+#### Define The Model
+
+```{r}
+
+xgb_model_tuned <- boost_tree(trees = tune(),
+                              tree_depth = tune(),
+                              mtry = tune(),
+                              min_n = tune(),
+                              sample_size = tune()) %>%
+        set_engine("xgboost") %>%
+        set_mode("classification") 
+
+```
+
+#### Write A Recipe
+
+```{r}
+
+xgb_recipe_tuned <- recipe(event_type ~ .,
+                           data = training_data_pp) %>%
+        step_rm(temp_id) %>%
+        step_other(shot_type, 
+                   threshold = 0.05, 
+                   id = "st_id") %>%
+        step_other(lag_event, 
+                   threshold = 0.05, 
+                   id = "le_id") %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+```
+
+#### Create A Workflow
+
+```{r}
+
+xgb_wflow_tuned <- workflow() %>%
+        add_model(xgb_model_tuned) %>%
+        add_recipe(xgb_recipe_tuned)
+
+```
+
+#### Tune The Model
+
+```{r}
+
+set.seed(18)
+
+folds <- vfold_cv(training_data_pp,
+                  strata = event_type)
+
+grid <- grid_latin_hypercube(trees(range = c(250, 2000)),
+                             tree_depth(range = c(1, 2)),
+                             finalize(mtry(), training_data_pp),
+                             min_n(range = c(10, 20)),
+                             sample_size = sample_prop(range = c(0.3, 0.9)),
+                             size = 50)
+
+registerDoParallel()
+
+set.seed(18)
+
+xgb_tuned <- tune_race_anova(xgb_wflow_tuned,
+                             resamples = folds,
+                             grid = grid)
+
+best_param <- show_best(xgb_tuned,
+                        metric = "roc_auc")
+
+best_param
+
+```
+
+#### Fit The Model
+
+```{r}
+
+tuned_best_param <- tibble(trees = best_param$trees[1],
+                     mtry = best_param$mtry[1],
+                     min_n = best_param$min_n[1],
+                     tree_depth = best_param$tree_depth[1],
+                     sample_size = best_param$sample_size[1])
+
+xgb_wflow_tuned_final <- xgb_wflow_tuned %>%
+        finalize_workflow(tuned_best_param)
+
+xgb_fit_tuned <- xgb_wflow_tuned_final %>%
+        fit(training_data_pp)
+
+```
+
+#### Check AUC With Training Data
+
+```{r}
+
+tuned_train_res <- augment(xgb_fit_tuned, training_data_pp) %>%
+        roc_auc(event_type, .pred_goal) %>%
+        select(.estimate) %>%
+        rename(auc_tuned_training = .estimate)
+
+tuned_train_res 
+
+```
+
+#### Check AUC With Testing Data
+
+```{r}
+
+tuned_test_res <- predict(xgb_fit_tuned, 
+                          new_data = testing_data_pp %>% select(-event_type),
+                          type = "prob")
+
+tuned_test_res <- bind_cols(tuned_test_res, 
+                            testing_data_pp %>% select(event_type))
+
+tuned_auc <- roc_auc(tuned_test_res, event_type, .pred_goal)[3] %>%
+        rename(auc_tuned_testing = .estimate)
+
+tuned_auc
+
+```
+
+#### Actual v Predicted Goals
+
+```{r}
+
+tuned_a_v_p <- summarize(tuned_test_res,
+                         actual_goals = sum(event_type == "goal"),
+                         predicted_goals = sum(.pred_goal),
+                         diff = round(predicted_goals - actual_goals, 1),
+                         diff_perc = round((diff / actual_goals), 3) * 100)
+
+tuned_a_v_p
+
+```
+
+#### Importance of Variables
+
+```{r}
+
+extract_fit_parsnip(xgb_fit_tuned) %>%
+        vip(num_features = 20)
 
 ```
