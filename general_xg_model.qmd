@@ -875,7 +875,7 @@ tuning_grid <- grid_latin_hypercube(trees(range = c(300, 500)),
                              finalize(mtry(), training_data_pp),
                              min_n(range = c(15, 40)),
                              sample_size = sample_prop(range = c(0.75, 0.9)),
-                             size = 50)
+                             size = 100)
 
 registerDoParallel()
 
@@ -902,11 +902,11 @@ tuned_best_param <- tibble(trees = best_param$trees[1],
                      tree_depth = best_param$tree_depth[1],
                      sample_size = best_param$sample_size[1])
 
-#tuned_best_param <- tibble(trees = 333,
-                     #mtry = 11,
-                     #min_n = 18,
+#tuned_best_param <- tibble(trees = 379,
+                     #mtry = 6,
+                     #min_n = 23,
                      #tree_depth = 3,
-                     #sample_size = 0.88185)
+                     #sample_size = 0.85974)
 
 xgb_wflow_tuned_final <- xgb_wflow_tuned %>%
         finalize_workflow(tuned_best_param)
@@ -967,5 +967,13 @@ tuned_a_v_p
 
 extract_fit_parsnip(xgb_fit_tuned) %>%
         vip(num_features = 20)
+
+```
+
+## Export The Model
+
+```{r}
+
+saveRDS(xgb_fit_tuned, "xg_model.rds")
 
 ```
