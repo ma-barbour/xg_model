@@ -644,6 +644,20 @@ pbp_data <- pbp_data %>%
 
 ### Pre-Process The PBP Data
 
+Among other things, this step adds predictor variables to the play-by-play data:
+
+-   prior event in the play-by-play data;
+
+-   zone for prior event in the play-by-play data;
+
+-   time elapsed since the prior event in the play-by-play data;
+
+-   change on the y-axis after the prior event in the play-by-play data;
+
+-   juicy rebounds; and
+
+-   penalty shots.
+
 Note: this pre-processing removes shootouts and empty net goals.
 
 ```{r}
@@ -862,6 +876,8 @@ xgb_wflow_tuned <- workflow() %>%
 ```
 
 #### Tune The Model
+
+Note: an iterative process was used to narrow the ranges for the tuning parameters.
 
 ```{r}
 
