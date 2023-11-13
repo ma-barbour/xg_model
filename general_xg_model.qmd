@@ -29,7 +29,7 @@ library(vip)
 
 ## Load Play-By-Play Data
 
-Load the play-by-play data if they're saved locally then jump to Join Play-By-Play Data below. Otherwise, load the NHL API function and pull the data.
+If the play-by-play data are saved locally: (1) load the data here; and (2) jump to **Join Play-By-Play Data** below.
 
 ```{r}
 
@@ -41,9 +41,11 @@ pbp_2017_2018 <- readRDS("pbp_2017_2018.rds")
 
 ```
 
+Otherwise, use these functions to pull the data from the NHL's API.
+
 ## NHL API Functions
 
-### Get Season Schedule
+### Get Schedule Data
 
 ```{r}
 
@@ -112,7 +114,7 @@ get_season_schedule <- function(season) {
 
 ```
 
-### Get Play-By-Play
+### Get Play-By-Play Data
 
 ```{r}
 
@@ -374,7 +376,7 @@ get_play_by_play_data <- function(game_id) {
 
 ```
 
-## Get Schedule Data
+## Pull Schedule Data
 
 Pull the regular season schedules for:
 
@@ -414,7 +416,7 @@ schedule_2017_2018 <- get_season_schedule(20172018)
 
 ```
 
-## Get Play-By-Play Data
+## Pull Play-By-Play Data
 
 ```{r}
 
@@ -613,7 +615,7 @@ pbp_data %>% mutate(lag_zone = lag(zone)) %>% mutate(y_diff = case_when(event_y 
 
 ```
 
-### Cross-Ice + Rebounds
+### Cross-Ice On Rebounds
 
 ```{r}
 
@@ -642,11 +644,14 @@ pbp_data <- pbp_data %>%
 
 ### Pre-Process The PBP Data
 
+Note: this pre-processing removes shootouts and empty net goals.
+
 ```{r}
 
 pbp_data_pp <- pbp_data %>%
         mutate(lag_event = lag(event_type),
                lag_zone = lag(zone),
+               lag_penalty_desc = substr(lag(penalty_description), 1, 2),
                elapsed_time = period_time_s - lag(period_time_s),
                y_diff = case_when(
                        event_y >= 0 & lag(event_y >= 0) ~ abs(event_y - lag(event_y)), 
@@ -657,12 +662,17 @@ pbp_data_pp <- pbp_data %>%
                lag_event = if_else(is.na(lag_event), "unknown", lag_event),
                lag_zone = if_else(is.na(lag_zone), "unknown", lag_zone),
                elapsed_time = if_else(is.na(elapsed_time), 0, elapsed_time),
-               y_diff = if_else(is.na(y_diff), 0, y_diff)) %>%
+               y_diff = if_else(is.na(y_diff), 0, y_diff),
+               lag_penalty_desc = if_else(is.na(lag_penalty_desc), "xx", lag_penalty_desc)) %>%
         mutate(juicy_rebound = if_else(
                 lag_event == "shot-on-goal" &
-                        y_diff > 0.5 &
-                        elapsed_time > 0.5 &
-                        elapsed_time < 3.5,
+                        y_diff >= 1 &
+                        elapsed_time > 0 &
+                        elapsed_time < 3,
+                TRUE,
+                FALSE)) %>%
+        mutate(penalty_shot = if_else(
+                lag_penalty_desc == "ps",  
                 TRUE,
                 FALSE)) %>%
         filter(event_type == "goal" | event_type == "shot-on-goal",
@@ -672,7 +682,8 @@ pbp_data_pp <- pbp_data %>%
                period = as.factor(period),
                event_pp = as.factor(event_pp),
                event_sh = as.factor(event_sh),
-               juicy_rebound = as.factor(juicy_rebound)) %>%
+               juicy_rebound = as.factor(juicy_rebound),
+               penalty_shot = as.factor(penalty_shot)) %>%
         select(event_type,
                sa_distance,
                sa_angle,
@@ -685,7 +696,9 @@ pbp_data_pp <- pbp_data %>%
                elapsed_time,
                y_diff,
                juicy_rebound,
+               penalty_shot,
                temp_id)
+
 ```
 
 ### Split The Data
