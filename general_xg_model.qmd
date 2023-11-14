@@ -4,11 +4,11 @@ format: html
 editor: visual
 ---
 
-# THIS MODEL IS UNDER CONSTRUCTION
-
 ## Introduction
 
 This is an expected goals model built using XGBoost.
+
+This model computes xG values for shots on goal. It does not compute xG values for missed shots (unlike many other public models).
 
 ## Basic Setup
 
