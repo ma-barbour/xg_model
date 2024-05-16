@@ -6,9 +6,15 @@ editor: visual
 
 ## Introduction
 
-This is an expected goals model for the NHL built using XGBoost.
+This is an NHL expected goals (xG) model.
 
-This model computes xG values for shots on goal. It does not compute xG values for missed shots (unlike many other public models).
+This model computes xG values for shots on goal. It does not compute xG values for missed shots (unlike many other public models) or shots on an empty net.
+
+The model type is XGBoost.
+
+The data used to fit the model go back to the 2017-2018 season but exclude the 2020-2021 season (COVID-19).
+
+This model was last updated on May 16, 2024.
 
 ## Basic Setup
 
@@ -24,12 +30,13 @@ library(forcats)
 library(finetune)
 library(doParallel)
 library(vip)
+library(bundle)
 
 ```
 
 ## Load Play-By-Play Data
 
-If the play-by-play data are saved locally: (1) load the data here; and (2) jump to **Join Play-By-Play Data** below.
+If the play-by-play data are saved locally then load the data here and jump to **Join Play-By-Play Data** below.
 
 ```{r}
 
@@ -71,9 +78,9 @@ if(file.exists("pbp_2017_2018.rds")) {
 
 ```
 
-Otherwise, use these functions to pull the data from the NHL's API.
-
 ## NHL API Functions
+
+These functions pull schedule and play-by-play data from the NHL's API.
 
 ### Get Schedule Data
 
@@ -409,7 +416,7 @@ get_play_by_play_data <- function(game_id) {
 
 ## Pull Schedule Data
 
-Pull the regular season schedules for:
+Pull the regular season schedules for the following seasons:
 
 -   2023-2024;
 
@@ -423,7 +430,7 @@ Pull the regular season schedules for:
 
 -   2017-2018.
 
-This excludes the COVID-19 season in 2020-2021.
+**Note: this excludes the COVID-19 season in 2020-2021.**
 
 ```{r}
 
@@ -514,6 +521,8 @@ if(!file.exists("schedule_2017_2018.rds")) {
 ```
 
 ## Pull Play-By-Play Data
+
+Pull the play-by-play data for each of the seasons set out above.
 
 ```{r}
 
@@ -716,7 +725,11 @@ pbp_data %>% filter(period != 5, event_type == "goal") %>% group_by(shot_type) %
 
 ```
 
+Note the NAs here.
+
 ### Goals Scored By Period
+
+Start with all goals (excluding shootout goals).
 
 ```{r}
 
@@ -724,7 +737,7 @@ pbp_data %>% filter(period != 5, event_type == "goal") %>% group_by(period) %>% 
 
 ```
 
-### Goals Scored By Period Excluding Empty Net Goals
+Now exclude empty net goals which boost the third period but are not relevant to this xG model.
 
 ```{r}
 
@@ -734,11 +747,15 @@ pbp_data %>% filter(period != 5, event_type == "goal", event_on_en == "FALSE") %
 
 ### Events Prior To A Goal
 
+Show the breakdown of events occurring immediately before a goal.
+
 ```{r}
 
 pbp_data %>% filter(period != 5) %>% mutate(lead_event = lead(event_type)) %>% filter(lead_event == "goal") %>% group_by(event_type) %>% summarise(count = n()) %>% arrange(desc(count))
 
 ```
+
+Show the breakdown of events occurring two steps before a goal.
 
 ```{r}
 
@@ -754,6 +771,8 @@ pbp_data %>% filter(period != 5) %>% mutate(lead_event = lead(event_type)) %>% f
 
 ```
 
+Note the NAs here.
+
 ### Elapsed Time Since Event Prior To A Goal
 
 Zoom in on events under 30 seconds.
@@ -766,7 +785,7 @@ pbp_data %>% mutate(elapsed_time = period_time_s - lag(period_time_s)) %>% filte
 
 ### Cross-Ice Plays
 
-Zoom in on cross-ice plays under 40 feet.
+Zoom in on cross-ice plays that occur within 3 seconds of a previous event (and under 40 feet on the y-axis).
 
 ```{r}
 
@@ -776,17 +795,21 @@ pbp_data %>% mutate(lag_zone = lag(zone)) %>% mutate(y_diff = case_when(event_y 
 
 ### Cross-Ice On Rebounds
 
+Repeat, but filter for when the lag event is a shot on goal.
+
 ```{r}
 
 pbp_data %>% mutate(lag_zone = lag(zone)) %>% mutate(y_diff = case_when(event_y >= 0 & lag(event_y >= 0) ~ abs(event_y - lag(event_y)), event_y < 0 & lag(event_y < 0) ~ abs(event_y - lag(event_y)), event_y >= 0 & lag(event_y) < 0 ~ event_y + abs(lag(event_y)), lag(event_y) >=0 & event_y < 0 ~ abs(event_y) + lag(event_y))) %>% mutate(elapsed_time = period_time_s - lag(period_time_s)) %>% mutate(lag_event = lag(event_type)) %>% filter(period != 5, event_type == "goal", lag_zone == "O", y_diff < 40, lag_event == "shot-on-goal", elapsed_time >= 0 & elapsed_time < 3) %>% ggplot() + geom_histogram(aes(y_diff), binwidth = 1) + theme_minimal() + labs(y = "Goals On Rebounds", x = "Cross Ice Distance")
 
 ```
 
-### Missed Shot Percentages By Skater
+### Missed Shot Attempt Percentages By Skater
+
+Some skaters miss the net more frequently than others.
 
 ```{r}
 
-pbp_data %>% filter(period != 5, event_type == "goal" | event_type == "shot-on-goal" | event_type == "missed-shot") %>% group_by(shooter_id) %>% summarise(shots = n(), missed = sum(event_type == "missed-shot")) %>% mutate(miss_percentage = round(((missed / shots) * 100), 1)) %>% filter(shots > 500) %>% ggplot() + geom_histogram(aes(miss_percentage), binwidth = 1) + theme_minimal() + labs(y = "Skater Count (Minimum 500 Shots)", x = "Missed Shot Percentage")
+pbp_data %>% filter(period != 5, event_type == "goal" | event_type == "shot-on-goal" | event_type == "missed-shot") %>% group_by(shooter_id) %>% summarise(shots = n(), missed = sum(event_type == "missed-shot")) %>% mutate(miss_percentage = round(((missed / shots) * 100), 1)) %>% filter(shots > 500) %>% ggplot() + geom_histogram(aes(miss_percentage), binwidth = 1) + theme_minimal() + labs(y = "Skater Count (Minimum 500 Shots)", x = "Missed Shot Attempt Percentage")
 
 ```
 
@@ -803,7 +826,7 @@ pbp_data <- pbp_data %>%
 
 ### Pre-Process The PBP Data
 
-Among other things this step adds predictor variables:
+This step filters the data for shots and goals (excluding empty nets and shootouts). It also adds several predictor variables:
 
 -   two prior events in the play-by-play data;
 
@@ -817,112 +840,210 @@ Among other things this step adds predictor variables:
 
 -   penalty shots.
 
-Note: this pre-processing removes shootouts and empty net goals.
+The pre-processing steps are captured in a function that can be used for other applications.
 
 ```{r}
 
-pbp_data_pp <- pbp_data %>%
-        mutate(lag_event = lag(event_type),
-               lag_event_2 = lag(event_type, 2),
-               lag_zone = lag(zone),
-               lag_penalty_desc = substr(lag(penalty_description), 1, 2),
-               elapsed_time = period_time_s - lag(period_time_s),
-               y_diff = case_when(
-                       event_y >= 0 & lag(event_y >= 0) ~ abs(event_y - lag(event_y)), 
-                       event_y < 0 & lag(event_y < 0) ~ abs(event_y - lag(event_y)), 
-                       event_y >= 0 & lag(event_y) < 0 ~ event_y + abs(lag(event_y)), 
-                       event_y < 0 & lag(event_y) >=0 ~ abs(event_y) + lag(event_y))) %>%
-        mutate(shot_type = if_else(is.na(shot_type), "unknown", shot_type),
-               lag_event = if_else(is.na(lag_event), "unknown", lag_event),
-               lag_event_2 = if_else(is.na(lag_event_2), "unknown", lag_event_2),
-               lag_zone = if_else(is.na(lag_zone), "unknown", lag_zone),
-               elapsed_time = if_else(is.na(elapsed_time), 0, elapsed_time),
-               y_diff = if_else(is.na(y_diff), 0, y_diff),
-               lag_penalty_desc = if_else(is.na(lag_penalty_desc), "xx", lag_penalty_desc)) %>%
-        mutate(juicy_rebound = if_else(
-                lag_event == "shot-on-goal" &
-                        y_diff >= 1 &
-                        elapsed_time < 4,
-                TRUE,
-                FALSE)) %>%
-        mutate(penalty_shot = if_else(
-                lag_penalty_desc == "ps",  
-                TRUE,
-                FALSE)) %>%
-        filter(event_type == "goal" | event_type == "shot-on-goal",
-               event_on_en == "FALSE",
-               period != 5) %>%
-        mutate(event_type = as.factor(event_type),
-               period = as.factor(period),
-               event_pp = as.factor(event_pp),
-               event_sh = as.factor(event_sh),
-               juicy_rebound = as.factor(juicy_rebound),
-               penalty_shot = as.factor(penalty_shot)) %>%
-        select(event_type,
-               sa_distance,
-               sa_angle,
-               shot_type,
-               period,
-               event_pp,
-               event_sh,
-               lag_event,
-               lag_event_2,
-               lag_zone,
-               elapsed_time,
-               y_diff,
-               juicy_rebound,
-               penalty_shot,
-               temp_id)
+xg_pp_function <- function(pbp_data) {
+        
+        # Add variables
+        
+        pbp_data_pp <- pbp_data %>%
+                mutate(lag_event = lag(event_type),
+                       lag_event_2 = lag(event_type, 2),
+                       lag_zone = lag(zone),
+                       lag_penalty_desc = substr(lag(penalty_description), 1, 2),
+                       elapsed_time = period_time_s - lag(period_time_s),
+                       y_diff = case_when(
+                               event_y >= 0 & lag(event_y >= 0) ~ abs(event_y - lag(event_y)), 
+                               event_y < 0 & lag(event_y < 0) ~ abs(event_y - lag(event_y)), 
+                               event_y >= 0 & lag(event_y) < 0 ~ event_y + abs(lag(event_y)), 
+                               event_y < 0 & lag(event_y) >=0 ~ abs(event_y) + lag(event_y)))
+        
+        # Perform some clean-up for NA values
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                mutate(shot_type = if_else(is.na(shot_type), "unknown", shot_type),
+                       lag_event = if_else(is.na(lag_event), "unknown", lag_event),
+                       lag_event_2 = if_else(is.na(lag_event_2), "unknown", lag_event_2),
+                       lag_zone = if_else(is.na(lag_zone), "unknown", lag_zone),
+                       elapsed_time = if_else(is.na(elapsed_time), 0, elapsed_time),
+                       y_diff = if_else(is.na(y_diff), 0, y_diff),
+                       lag_penalty_desc = if_else(is.na(lag_penalty_desc), "xx", lag_penalty_desc))
+        
+        # Add juicy_rebound variable (shot within 3 seconds with movement on the y-axis)
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                mutate(juicy_rebound = if_else(
+                        lag_event == "shot-on-goal" &
+                                y_diff >= 1 &
+                                elapsed_time < 4,
+                        TRUE,
+                        FALSE))
+        
+        # Add penalty_shot variable
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                mutate(penalty_shot = if_else(
+                        lag_penalty_desc == "ps",  
+                        TRUE,
+                        FALSE))
+        
+        # Shrink the data to capture shots (exclude empty nets and shootouts)
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                filter(event_type == "goal" | event_type == "shot-on-goal",
+                       event_on_en == "FALSE",
+                       period != 5) 
+        
+        # Convert some variables to factors
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                mutate(event_type = as.factor(event_type),
+                       period = as.factor(period),
+                       event_pp = as.factor(event_pp),
+                       event_sh = as.factor(event_sh),
+                       juicy_rebound = as.factor(juicy_rebound),
+                       penalty_shot = as.factor(penalty_shot))
+        
+        # Fix the shot angle on 0 distance shots
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                mutate(sa_angle = if_else(sa_distance == 0, 0, sa_angle)) 
+        
+        # Select model data
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                select(event_type,
+                       sa_distance,
+                       sa_angle,
+                       shot_type,
+                       period,
+                       event_pp,
+                       event_sh,
+                       lag_event,
+                       lag_event_2,
+                       lag_zone,
+                       elapsed_time,
+                       y_diff,
+                       juicy_rebound,
+                       penalty_shot,
+                       temp_id) 
+        
+        # Final clean-up
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                filter(sa_distance >= 0,
+                       elapsed_time >= 0)
+        
+}
+
+pbp_data_pp <- xg_pp_function(pbp_data)
+
+saveRDS(xg_pp_function, "xg_pp_function.rds")
 
 ```
 
 ### Split The Data
 
+Note: strata = event_type.
+
 ```{r}
 
 set.seed(18)
 
-split_data <- initial_split(data = pbp_data_pp)
+split_data <- initial_split(data = pbp_data_pp,
+                            strata = event_type)
 
-training_data_pp <- training(split_data)
-testing_data_pp <- testing(split_data)
+training_data <- training(split_data)
+testing_data <- testing(split_data)
 
-```
+set.seed(18)
 
-### Simple Model
-
-#### Define The Model
-
-```{r}
-
-xgb_model_simple <- boost_tree() %>%
-        set_engine("xgboost") %>%
-        set_mode("classification") 
+data_folds <- vfold_cv(training_data,
+                       v = 10,
+                       strata = event_type)
 
 ```
 
-#### Write A Recipe
+### Explore Models
 
-Among other things this step introduces two "interaction" terms:
-
--   distance of shot attempt \* angle of shot attempt; and
-
--   elapsed time \* difference between y coordinates.
+Write multiple recipes for an XGBoost model.
 
 ```{r}
 
-xgb_recipe_simple <- recipe(event_type ~ .,
-                            data = training_data_pp) %>%
-        step_rm(temp_id) %>%
+base_rec <- recipe(event_type ~ sa_distance +
+                           sa_angle +
+                           juicy_rebound,
+                   data = training_data) %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+shot_type_rec <- recipe(event_type ~ sa_distance +
+                                sa_angle +
+                                juicy_rebound +
+                                shot_type,
+                        data = training_data) %>%
         step_other(shot_type, 
-                   threshold = 0.05, 
-                   id = "st_id") %>%
+                   threshold = 0.05) %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+special_teams_rec <- recipe(event_type ~ sa_distance +
+                                    sa_angle +
+                                    juicy_rebound +
+                                    event_pp +
+                                    event_sh,
+                            data = training_data) %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE) 
+
+lag_events_rec <- recipe(event_type ~ sa_distance +
+                                 sa_angle +
+                                 juicy_rebound +
+                                 lag_event +
+                                 lag_event_2 +
+                                 lag_zone,
+                         data = training_data) %>%
         step_other(lag_event, 
                    threshold = 0.05, 
                    id = "le_id") %>%
         step_other(lag_event_2, 
                    threshold = 0.05, 
                    id = "le2_id") %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+time_y_diff_rec <- recipe(event_type ~ sa_distance +
+                                  sa_angle +
+                                  juicy_rebound +
+                                  elapsed_time +
+                                  y_diff,
+                          data = training_data) %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+everything_rec <- recipe(event_type ~ .,
+                         data = training_data) %>%
+        step_rm(temp_id) %>%
+        step_other(shot_type, 
+                   threshold = 0.05) %>%
+        step_other(lag_event, 
+                   threshold = 0.05) %>%
+        step_other(lag_event_2, 
+                   threshold = 0.05) %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+interactions_rec <- recipe(event_type ~ .,
+                           data = training_data) %>%
+        step_rm(temp_id) %>%
+        step_other(shot_type, 
+                   threshold = 0.05) %>%
+        step_other(lag_event, 
+                   threshold = 0.05) %>%
+        step_other(lag_event_2, 
+                   threshold = 0.05) %>%
         step_interact(terms = ~ sa_distance:sa_angle) %>%
         step_interact(terms = ~ elapsed_time:y_diff) %>%
         step_dummy(all_nominal_predictors(),
@@ -930,82 +1051,92 @@ xgb_recipe_simple <- recipe(event_type ~ .,
 
 ```
 
-#### Create A Workflow
+Fit the above recipes.
 
 ```{r}
 
-xgb_wflow_simple <- workflow() %>%
-        add_model(xgb_model_simple) %>%
-        add_recipe(xgb_recipe_simple)
+rec_list <- list(base = base_rec,
+                 shot_type = shot_type_rec,
+                 special_teams = special_teams_rec,
+                 lag_events = lag_events_rec,
+                 time_y_diff = time_y_diff_rec,
+                 everything = everything_rec,
+                 interactions = interactions_rec)
+
+exploratory_models <- workflow_set(rec_list,
+                                   list(xgb = boost_tree(mode = "classification"))) %>%
+        workflow_map("fit_resamples",
+                     seed = 18,
+                     verbose = TRUE,
+                     resamples = data_folds)
 
 ```
 
-#### Fit The Model
+Collect the metrics from all of the models.
 
 ```{r}
 
-xgb_fit_simple <- xgb_wflow_simple %>% 
-        fit(training_data_pp)
+collect_metrics(exploratory_models) %>% 
+        filter(.metric == "roc_auc") %>% 
+        arrange(desc(mean)) %>% 
+        select(wflow_id, 
+               .metric,
+               mean,
+               std_err) %>%
+        mutate(mean = round(mean, 3),
+               std_err = round(std_err, 5))
 
 ```
 
-#### Check AUC With Training Data
+The "interactions" model was slightly better than the "everything" model.
+
+Fit the "interactions" model using all of the training data and check the roc_auc.
 
 ```{r}
 
-simple_train_res <- augment(xgb_fit_simple, training_data_pp) %>%
-        roc_auc(event_type, .pred_goal) %>%
-        select(.estimate) %>%
-        rename(auc_simple_training = .estimate)
-
-simple_train_res 
+workflow() |>
+        add_model(boost_tree(mode = "classification")) %>%
+        add_recipe(interactions_rec) %>%
+        fit(data = training_data) %>%
+        augment(training_data) %>%
+        roc_auc(truth = event_type, .pred_goal) 
 
 ```
 
-#### Check AUC With Testing Data
+The roc_auc improved as should be expected. Now repeat that process on the testing data.
 
 ```{r}
 
-simple_test_res <- predict(xgb_fit_simple, 
-                           new_data = testing_data_pp %>% select(-event_type),
-                           type = "prob")
-
-simple_test_res <- bind_cols(simple_test_res, 
-                             testing_data_pp %>% select(event_type))
-
-simple_auc <- roc_auc(simple_test_res, event_type, .pred_goal)[3] %>%
-        rename(auc_simple_testing = .estimate)
-
-simple_auc
+workflow() |>
+        add_model(boost_tree(mode = "classification")) %>%
+        add_recipe(interactions_rec) %>%
+        fit(data = training_data) %>%
+        augment(testing_data) %>%
+        roc_auc(truth = event_type, .pred_goal) 
 
 ```
 
-#### Actual v Predicted Goals
-
-```{r}
-
-simple_a_v_p <- summarize(simple_test_res,
-                          actual_goals = sum(event_type == "goal"),
-                          predicted_goals = sum(.pred_goal),
-                          diff = round(predicted_goals - actual_goals, 1),
-                          diff_perc = round((diff / actual_goals), 3) * 100)
-
-simple_a_v_p
-
-```
+There's a small drop here but the model seems to do well enough when given new data.
 
 #### Importance Of Variables
 
 ```{r}
 
-extract_fit_parsnip(xgb_fit_simple) %>%
-        vip(num_features = 20)
+workflow() |>
+        add_model(boost_tree(mode = "classification")) %>%
+        add_recipe(interactions_rec) %>%
+        fit(data = training_data) %>%
+        extract_fit_parsnip() %>%
+        vip(num_features = 15) +
+        theme_minimal()
 
 ```
 
 ### Tuned Model
 
-#### Define The Model
+Now tune a model using the "interactions" recipe.
+
+#### Define The Model For Tuning
 
 ```{r}
 
@@ -1019,36 +1150,13 @@ xgb_model_tuned <- boost_tree(trees = tune(),
 
 ```
 
-#### Write A Recipe
-
-```{r}
-
-xgb_recipe_tuned <- recipe(event_type ~ .,
-                           data = training_data_pp) %>%
-        step_rm(temp_id) %>%
-        step_other(shot_type, 
-                   threshold = 0.05, 
-                   id = "st_id") %>%
-        step_other(lag_event, 
-                   threshold = 0.05, 
-                   id = "le_id") %>%
-        step_other(lag_event_2, 
-                   threshold = 0.05, 
-                   id = "le2_id") %>%
-        step_interact(terms = ~ sa_distance:sa_angle) %>%
-        step_interact(terms = ~ elapsed_time:y_diff) %>%
-        step_dummy(all_nominal_predictors(),
-                   one_hot = TRUE)
-
-```
-
 #### Create A Workflow
 
 ```{r}
 
 xgb_wflow_tuned <- workflow() %>%
         add_model(xgb_model_tuned) %>%
-        add_recipe(xgb_recipe_tuned)
+        add_recipe(interactions_rec)
 
 ```
 
@@ -1060,32 +1168,47 @@ Note: an iterative process was used to narrow the ranges for the tuning paramete
 
 set.seed(18)
 
-tuning_folds <- vfold_cv(training_data_pp,
-                  strata = event_type)
-
-tuning_grid <- grid_latin_hypercube(trees(range = c(300, 500)),
-                             tree_depth(range = c(2,3)),
-                             finalize(mtry(), training_data_pp),
-                             min_n(range = c(15, 40)),
-                             sample_size = sample_prop(range = c(0.75, 0.9)),
-                             size = 150)
+tuning_grid <- grid_latin_hypercube(trees(range = c(425, 750)),
+                                    tree_depth(range = c(2,3)),
+                                    finalize(mtry(), training_data),
+                                    min_n(range = c(1, 20)),
+                                    sample_size = sample_prop(range = c(0.8, 0.9)),
+                                    size = 30)
 
 registerDoParallel()
 
 set.seed(18)
 
 xgb_tuned <- tune_race_anova(xgb_wflow_tuned,
-                             resamples = tuning_folds,
-                             grid = tuning_grid)
+                             resamples = data_folds,
+                             grid = tuning_grid,
+                             metrics = metric_set(roc_auc),
+                             control = control_race(verbose_elim = TRUE))
+
+```
+
+Show the race.
+
+```{r}
+
+plot_race(xgb_tuned) +
+        theme_minimal()
+
+```
+
+Show the best tuning parameters.
+
+```{r}
 
 best_param <- show_best(xgb_tuned,
-                        metric = "roc_auc")
+                        metric = "roc_auc") %>%
+        select(-c(".estimator", "n", ".config"))
 
 best_param
 
 ```
 
-#### Fit The Model
+#### Fit A Tuned Model
 
 ```{r}
 
@@ -1095,17 +1218,17 @@ tuned_best_param <- tibble(trees = best_param$trees[1],
                            tree_depth = best_param$tree_depth[1],
                            sample_size = best_param$sample_size[1])
 
-#tuned_best_param <- tibble(trees = 317,
-                           #mtry = 13,
-                           #min_n = 17,
-                           #tree_depth = 3,
-                           #sample_size = 0.8412567)
+#tuned_best_param <- tibble(trees = 573,
+                           #mtry = 9,
+                           #min_n = 11,
+                           #tree_depth = 2,
+                           #sample_size = 0.8073802)
 
 xgb_wflow_tuned_final <- xgb_wflow_tuned %>%
         finalize_workflow(tuned_best_param)
 
 xgb_fit_tuned <- xgb_wflow_tuned_final %>%
-        fit(training_data_pp)
+        fit(training_data)
 
 ```
 
@@ -1113,7 +1236,7 @@ xgb_fit_tuned <- xgb_wflow_tuned_final %>%
 
 ```{r}
 
-tuned_train_res <- augment(xgb_fit_tuned, training_data_pp) %>%
+tuned_train_res <- augment(xgb_fit_tuned, training_data) %>%
         roc_auc(event_type, .pred_goal) %>%
         select(.estimate) %>%
         rename(auc_tuned_training = .estimate)
@@ -1122,16 +1245,18 @@ tuned_train_res
 
 ```
 
+There's a small improvement after tuning the parameters.
+
 #### Check AUC With Testing Data
 
 ```{r}
 
 tuned_test_res <- predict(xgb_fit_tuned, 
-                          new_data = testing_data_pp %>% select(-event_type),
+                          new_data = testing_data %>% select(-event_type),
                           type = "prob")
 
 tuned_test_res <- bind_cols(tuned_test_res, 
-                            testing_data_pp %>% select(event_type))
+                            testing_data %>% select(event_type))
 
 tuned_auc <- roc_auc(tuned_test_res, event_type, .pred_goal)[3] %>%
         rename(auc_tuned_testing = .estimate)
@@ -1139,6 +1264,8 @@ tuned_auc <- roc_auc(tuned_test_res, event_type, .pred_goal)[3] %>%
 tuned_auc
 
 ```
+
+Another small improvement here.
 
 #### Actual v Predicted Goals
 
@@ -1159,14 +1286,26 @@ tuned_a_v_p
 ```{r}
 
 extract_fit_parsnip(xgb_fit_tuned) %>%
-        vip(num_features = 20)
+        vip(num_features = 15) +
+        theme_minimal()
 
 ```
 
-## Export The Model
+## Save The Model
 
 ```{r}
 
-saveRDS(xgb_fit_tuned, "xg_model.rds")
+xgb_fit_tuned |>
+        bundle() |>
+        saveRDS("xg_model_2024.rds")
+
+# To load this model in another R session:
+
+#xg_model_2024 <- readRDS("xg_model_2024.rds") |>
+        #unbundle()
+
+# To simply save as .rds file:
+
+#saveRDS(xgb_fit_tuned, "xg_model_2024.rds")
 
 ```
