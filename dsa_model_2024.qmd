@@ -1,0 +1,1224 @@
+---
+title: "General Expected Goals Model"
+format: html
+editor: visual
+---
+
+## Introduction
+
+This model modifies my expected goals model by including all shot attempts. My goal with this model is to have a way to identify a dangerous shot attempt (DSA) as a binary outcome
+
+A potential threshold for a DSA is any shot attempt with a DSA value \>= 0.064. This would capture the top 40% of shot attempts (which account for roughly 3/4 of actual goals).
+
+Refer to my general xG model for additional details (e.g., EDA).
+
+This model was last updated on May 17, 2024.
+
+## Basic Setup
+
+```{r}
+
+# Load R packages
+
+library(tidymodels)
+library(jsonlite)
+library(lubridate)
+library(parsedate)
+library(forcats)
+library(finetune)
+library(doParallel)
+library(vip)
+library(bundle)
+
+```
+
+## Load Play-By-Play Data
+
+If the play-by-play data are saved locally then load the data here and jump to **Join Play-By-Play Data** below.
+
+```{r}
+
+if(file.exists("pbp_2023_2024.rds")) {
+        
+        pbp_2023_2024 <- readRDS("pbp_2023_2024.rds")
+        
+}
+
+if(file.exists("pbp_2022_2023.rds")) {
+        
+        pbp_2022_2023 <- readRDS("pbp_2022_2023.rds")
+        
+}
+
+if(file.exists("pbp_2021_2022.rds")) {
+        
+        pbp_2021_2022 <- readRDS("pbp_2021_2022.rds")
+        
+}
+
+if(file.exists("pbp_2019_2020.rds")) {
+        
+        pbp_2019_2020 <- readRDS("pbp_2019_2020.rds")
+        
+}
+
+if(file.exists("pbp_2018_2019.rds")) {
+        
+        pbp_2018_2019 <- readRDS("pbp_2018_2019.rds")
+        
+}
+
+if(file.exists("pbp_2017_2018.rds")) {
+        
+        pbp_2017_2018 <- readRDS("pbp_2017_2018.rds")
+        
+}
+
+```
+
+## NHL API Functions
+
+These functions pull schedule and play-by-play data from the NHL's API.
+
+### Get Schedule Data
+
+```{r}
+
+get_season_schedule <- function(season) {
+        
+        # Get team tri-codes for the season (using MTL as the base club)
+        
+        tri_code_url <- paste0("https://api-web.nhle.com/v1/club-schedule-season/mtl/", season)
+        
+        tri_code_data <- read_json(tri_code_url)
+        
+        tri_codes <- tri_code_data[["games"]] %>%
+                tibble() %>%
+                unnest_wider(1) %>%
+                filter(gameType == 2) %>%
+                select(awayTeam) %>%
+                unnest_wider(1)
+        
+        tri_codes <- unique(tri_codes$abbrev)
+        
+        # Loop through each team's season schedule
+        
+        base_url <- "https://api-web.nhle.com/v1/club-schedule-season/"
+        
+        schedule_loop_data <- list()
+        
+        for (i in (1:length(tri_codes))) {
+                
+                temp_schedule_data <- read_json(paste0(base_url, tri_codes[i], "/", season))
+                
+                temp_schedule <- temp_schedule_data[["games"]] %>%
+                        tibble() %>%
+                        unnest_wider(1) %>%
+                        filter(gameType == 2) %>%
+                        unnest_wider(awayTeam, names_sep = "_") %>%
+                        unnest_wider(homeTeam, names_sep = "_") %>%
+                        select(game_id = id,
+                               season,
+                               date = gameDate,
+                               away_team = awayTeam_abbrev,
+                               home_team = homeTeam_abbrev)
+                
+                temp_schedule$date <- as.Date(temp_schedule$date)
+                
+                schedule_loop_data[[i]] <- temp_schedule
+                
+        }
+        
+        # Combine the loop data
+        
+        schedule_data <- schedule_loop_data %>%
+                bind_rows()
+        
+        # Remove duplicates
+        
+        schedule_data <- unique(schedule_data)
+        
+        # Arrange by date
+        
+        schedule_data <- schedule_data %>%
+                arrange(date)
+        
+        return(schedule_data)
+        
+}
+
+```
+
+### Get Play-By-Play Data
+
+```{r}
+
+get_play_by_play_data <- function(game_id) {
+        
+        pbp_site <- read_json(paste0("https://api-web.nhle.com/v1/gamecenter/", game_id, "/play-by-play"))
+        
+        # Basic game data
+        
+        season <- pbp_site[["season"]]
+        date <- as.Date(pbp_site[["gameDate"]])
+        
+        # Team data
+        
+        away_team <- pbp_site[["awayTeam"]][["abbrev"]]
+        away_team_id <- pbp_site[["awayTeam"]][["id"]]
+        home_team <- pbp_site[["homeTeam"]][["abbrev"]]
+        home_team_id <- pbp_site[["homeTeam"]][["id"]]
+        
+        # Roster data
+        
+        players <- pbp_site[["rosterSpots"]] %>%
+                tibble() %>%
+                unnest_wider(1) %>%
+                unnest_wider(firstName, names_sep = "_") %>%
+                unnest_wider(lastName, names_sep = "_") %>%
+                mutate(player = paste(firstName_default, lastName_default)) %>%
+                select(player_id = playerId,
+                       player,
+                       position = positionCode,
+                       team_id = teamId) %>%
+                mutate(team = if_else(team_id == away_team_id, away_team, home_team))
+        
+        goalie_ids <- players %>%
+                filter(position == "G")
+        goalie_ids <- goalie_ids$player_id
+        
+        # Play-by-play data
+        
+        pbp_data <- pbp_site[["plays"]] %>%
+                tibble() %>%
+                unnest_wider(1) %>%
+                unnest_wider(periodDescriptor) %>%
+                unnest_wider(details, names_sep = "_")
+        
+        # Add game details to PBP data
+        
+        pbp_data <- pbp_data %>%
+                mutate(game_id = game_id,
+                       season = season,
+                       date = date,
+                       away_team = away_team,
+                       away_team_id = away_team_id,
+                       home_team = home_team,
+                       home_team_id = home_team_id)
+        
+        # Change name of period column
+        
+        pbp_data <- pbp_data %>%
+                rename(period = number)
+        
+        # Convert period time to seconds and add game time
+        
+        pbp_data$timeInPeriod <- ms(pbp_data$timeInPeriod)
+        pbp_data$timeInPeriod <- period_to_seconds(pbp_data$timeInPeriod)
+        pbp_data$game_time_s <- ((pbp_data$period - 1) * 1200) + pbp_data$timeInPeriod
+        pbp_data$game_time_s <- ifelse(pbp_data$game_time_s == 4800, NA, pbp_data$game_time_s)
+        
+        # Add logical for when event team = home team
+        
+        pbp_data <- pbp_data %>%
+                mutate(event_team_home = if_else(
+                        details_eventOwnerTeamId == home_team_id, TRUE, FALSE))
+        
+        # Add fixed coordinates
+        # Establish o-zone by period
+        
+        pbp_data <- pbp_data %>%
+                group_by(details_eventOwnerTeamId, period) %>%
+                mutate(median_o_zone = median(details_xCoord[details_zoneCode == "O"], na.rm = TRUE)) %>%
+                ungroup()
+        
+        # The home team is always shooting to the "right"
+        
+        pbp_data <- pbp_data %>%
+                mutate(x_fixed = case_when(
+                        details_eventOwnerTeamId == home_team_id & median_o_zone > 0 ~ details_xCoord,
+                        details_eventOwnerTeamId == home_team_id & median_o_zone < 0 ~ 0 - details_xCoord,
+                        details_eventOwnerTeamId == away_team_id & median_o_zone > 0 ~ 0 - details_xCoord,
+                        details_eventOwnerTeamId == away_team_id & median_o_zone < 0 ~ details_xCoord)) %>%
+                mutate(y_fixed = case_when(
+                        details_eventOwnerTeamId == home_team_id & median_o_zone > 0 ~ details_yCoord,
+                        details_eventOwnerTeamId == home_team_id & median_o_zone < 0 ~ 0 - details_yCoord,
+                        details_eventOwnerTeamId == away_team_id & median_o_zone > 0 ~ 0 - details_yCoord,
+                        details_eventOwnerTeamId == away_team_id & median_o_zone < 0 ~ details_yCoord))
+        
+        # Add shot attempt distance from middle of the net (Euclidean distance formula)
+        
+        pbp_data <- pbp_data %>%
+                mutate(sa_distance = case_when(
+                        details_eventOwnerTeamId == home_team_id & typeDescKey %in% c("shot-on-goal", "missed-shot", "goal") ~ round(abs(sqrt((x_fixed - 89)^2 + (y_fixed)^2)), 1),
+                        details_eventOwnerTeamId == away_team_id & typeDescKey %in% c("shot-on-goal", "missed-shot", "goal") ~ round(abs(sqrt((x_fixed - (-89))^2 + (y_fixed)^2)), 1)))
+        
+        # Add shot attempt angle from middle of the net
+        
+        pbp_data <- pbp_data %>%
+                mutate(sa_angle = case_when(
+                        details_eventOwnerTeamId == home_team_id & typeDescKey %in% c("shot-on-goal", "missed-shot", "goal") ~ round(abs(atan((0-y_fixed) / (89-x_fixed)) * (180 / pi)), 1),
+                        details_eventOwnerTeamId == away_team_id & typeDescKey %in% c("shot-on-goal", "missed-shot", "goal") ~ round(abs(atan((0-y_fixed) / (-89-x_fixed)) * (180 / pi)), 1))) %>%
+                mutate(sa_angle = ifelse((details_eventOwnerTeamId == home_team_id & x_fixed > 89) | (details_eventOwnerTeamId == away_team_id & x_fixed < -89), 180 - sa_angle, sa_angle))
+        
+        # Extend game state data
+        # Players on-ice
+        
+        pbp_data <- pbp_data %>%
+                mutate(away_goalies_oi = as.numeric(substr(pbp_data$situationCode, 1, 1)),
+                       away_skaters_oi = as.numeric(substr(pbp_data$situationCode, 2, 2)),
+                       home_skaters_oi = as.numeric(substr(pbp_data$situationCode, 3, 3)),
+                       home_goalies_oi = as.numeric(substr(pbp_data$situationCode, 4, 4))) %>%
+                mutate(away_pp = case_when(
+                        away_goalies_oi == 1 & away_skaters_oi > home_skaters_oi ~ TRUE,
+                        away_goalies_oi == 0 & away_skaters_oi > (home_skaters_oi + 1) ~ TRUE,
+                        TRUE ~ FALSE)) %>%
+                mutate(home_pp = case_when(
+                        home_goalies_oi == 1 & home_skaters_oi > away_skaters_oi ~ TRUE,
+                        home_goalies_oi == 0 & home_skaters_oi > (away_skaters_oi + 1) ~ TRUE,
+                        TRUE ~ FALSE))
+        
+        # Event on power play or short handed
+        
+        pbp_data <- pbp_data %>%
+                mutate(event_pp = case_when(
+                        details_eventOwnerTeamId == home_team_id & home_pp == TRUE ~ TRUE,
+                        details_eventOwnerTeamId == away_team_id & away_pp == TRUE ~ TRUE,
+                        TRUE ~ FALSE)) %>%
+                mutate(event_sh = case_when(
+                        details_eventOwnerTeamId == home_team_id & away_pp == TRUE ~ TRUE,
+                        details_eventOwnerTeamId == away_team_id & home_pp == TRUE ~ TRUE,
+                        TRUE ~ FALSE))
+        
+        # Events with empty net
+        
+        pbp_data <- pbp_data %>%
+                mutate(event_on_en = case_when(
+                        details_eventOwnerTeamId == home_team_id & away_goalies_oi == 0 ~ TRUE,
+                        details_eventOwnerTeamId == away_team_id & home_goalies_oi == 0 ~ TRUE,
+                        TRUE ~ FALSE)) %>%
+                mutate(event_w_en = case_when(
+                        details_eventOwnerTeamId == home_team_id & home_goalies_oi == 0 ~ TRUE,
+                        details_eventOwnerTeamId == away_team_id & away_goalies_oi == 0 ~ TRUE,
+                        TRUE ~ FALSE))
+        
+        # Add dangerous shot attempts (unblocked shot attempt in good location)
+        
+        pbp_data <- pbp_data %>%
+                mutate(sa_dangerous = case_when(
+                        sa_distance < 30 & sa_angle < 55 ~ TRUE,
+                        sa_distance < 25 & sa_angle < 58 ~ TRUE,
+                        sa_distance < 20 & sa_angle < 62 ~ TRUE,
+                        sa_distance < 15 & sa_angle < 67 ~ TRUE,
+                        sa_distance < 10 & sa_angle < 73 ~ TRUE,
+                        sa_distance < 5 & sa_angle < 80 ~ TRUE,
+                        sa_distance < 3 ~ TRUE,
+                        TRUE ~ FALSE))
+        
+        # Select the target data
+        
+        pbp_data <- pbp_data %>%
+                select(any_of(c("game_id",
+                                "season",
+                                "date",
+                                "away_team",
+                                "away_team_id",
+                                "home_team",
+                                "home_team_id",
+                                "sortOrder",
+                                "period",
+                                "periodType",
+                                "timeInPeriod",
+                                "game_time_s",
+                                "away_goalies_oi",
+                                "away_skaters_oi",
+                                "home_skaters_oi",
+                                "home_goalies_oi",
+                                "away_pp",
+                                "home_pp",
+                                "event_pp",
+                                "event_sh",
+                                "event_on_en",
+                                "event_w_en",
+                                "details_eventOwnerTeamId",
+                                "event_team_home",
+                                "typeDescKey",
+                                "details_xCoord",
+                                "details_yCoord",
+                                "x_fixed",
+                                "y_fixed",
+                                "details_zoneCode",
+                                "details_shootingPlayerId",
+                                "details_goalieInNetId",
+                                "details_shotType",
+                                "sa_distance",
+                                "sa_angle",
+                                "sa_dangerous",
+                                "details_scoringPlayerId",
+                                "details_assist1PlayerId",
+                                "details_assist2PlayerId",
+                                "details_hittingPlayerId",
+                                "details_hitteePlayerId",
+                                "details_blockingPlayerId",
+                                "details_committedByPlayerId",
+                                "details_drawnByPlayerId",
+                                "details_descKey",
+                                "details_typeCode",
+                                "details_duration",
+                                "details_winningPlayerId",
+                                "details_losingPlayerId",
+                                "details_playerId",
+                                "details_reason")))
+        
+        # Rename some of the columns
+        
+        col_names <- c(event_sort = "sortOrder",
+                       period_type = "periodType",
+                       period_time_s = "timeInPeriod",
+                       event_team_id = "details_eventOwnerTeamId",
+                       event_type = "typeDescKey",
+                       event_x = "details_xCoord",
+                       event_y = "details_yCoord",
+                       zone = "details_zoneCode",
+                       shooter_id = "details_shootingPlayerId",
+                       shot_type = "details_shotType",
+                       scorer_id = "details_scoringPlayerId",
+                       assist_1_id = "details_assist1PlayerId",
+                       assist_2_id = "details_assist2PlayerId",
+                       hitter_id = "details_hittingPlayerId",
+                       hittee_id = "details_hitteePlayerId",
+                       blocker_id = "details_blockingPlayerId",
+                       penalized_id = "details_committedByPlayerId",
+                       penalty_draw_id = "details_drawnByPlayerId",
+                       penalty_description = "details_descKey",
+                       penalty_type = "details_typeCode",
+                       penalty_duration = "details_duration",
+                       fo_winner_id = "details_winningPlayerId",
+                       fo_loser_id = "details_losingPlayerId",
+                       taway_gaway_id = "details_playerId",
+                       details = "details_reason",
+                       goalie_id = "details_goalieInNetId")
+        
+        pbp_data <- rename(pbp_data, any_of(col_names))
+        
+        # Move scorer_id to shooter_id
+        
+        pbp_data <- pbp_data %>%
+                mutate(shooter_id = if_else(event_type == "goal", scorer_id, shooter_id)) %>%
+                select(-scorer_id)
+        
+        return(pbp_data)
+        
+}
+```
+
+## Pull Schedule Data
+
+Pull the regular season schedules for the following seasons:
+
+-   2023-2024;
+
+-   2022-2023;
+
+-   2021-2022;
+
+-   2019-2020;
+
+-   2018-2019; and
+
+-   2017-2018.
+
+**Note: this excludes the COVID-19 season in 2020-2021.**
+
+```{r}
+
+if(!file.exists("schedule_2023_2024.rds")) {
+        
+        # Get schedule data for 2023_2024 season
+        
+        schedule_2023_2024 <- get_season_schedule(20232024)
+        
+        saveRDS(schedule_2023_2024, "schedule_2023_2024.rds")
+        
+} else {
+        
+        schedule_2023_2024 <- readRDS("schedule_2023_2024.rds")  
+}
+
+
+if(!file.exists("schedule_2022_2023.rds")) {
+        
+        # Get schedule data for 2022_2023 season
+        
+        schedule_2022_2023 <- get_season_schedule(20222023)
+        
+        saveRDS(schedule_2023_2024, "schedule_2022_2023.rds")
+        
+} else {
+        
+        schedule_2022_2023 <- readRDS("schedule_2022_2023.rds")  
+}
+
+
+if(!file.exists("schedule_2021_2022.rds")) {
+        
+        # Get schedule data for 2021_2022 season
+        
+        schedule_2021_2022 <- get_season_schedule(20212022)
+        
+        saveRDS(schedule_2021_2022, "schedule_2021_2022.rds")
+        
+} else {
+        
+        schedule_2021_2022 <- readRDS("schedule_2021_2022.rds")
+        
+}
+
+
+if(!file.exists("schedule_2019_2020.rds")) {
+        
+        # Get schedule data for 2019_2020 season
+        
+        schedule_2019_2020 <- get_season_schedule(20192020)
+        
+        saveRDS(schedule_2019_2020, "schedule_2019_2020.rds")
+        
+} else {
+        
+        schedule_2019_2020 <- readRDS("schedule_2019_2020.rds")  
+}
+
+
+if(!file.exists("schedule_2018_2019.rds")) {
+        
+        # Get schedule data for 2018_2019 season
+        
+        schedule_2018_2019 <- get_season_schedule(20182019)
+        
+        saveRDS(schedule_2018_2019, "schedule_2018_2019.rds")
+        
+} else {
+        
+        schedule_2018_2019 <- readRDS("schedule_2018_2019.rds")  
+}
+
+
+if(!file.exists("schedule_2017_2018.rds")) {
+        
+        # Get schedule data for 2017_2018 season
+        
+        schedule_2017_2018 <- get_season_schedule(20172018)
+        
+        saveRDS(schedule_2017_2018, "schedule_2017_2018.rds")
+        
+} else {
+        
+        schedule_2017_2018 <- readRDS("schedule_2017_2018.rds")  
+}
+
+```
+
+## Pull Play-By-Play Data
+
+Pull the play-by-play data for each of the seasons set out above.
+
+```{r}
+
+if(!file.exists("pbp_2023_2024.rds")) {
+        
+        # Get PBP data for 2023-2024 season
+        
+        game_ids_2023_2024 <- schedule_2023_2024$game_id
+        
+        temp_pbp_list_23_24 <- list()
+        
+        for (i in 1:length(game_ids_2023_2024)) {
+                
+                pbp_data <- get_play_by_play_data(game_ids_2023_2024[i])
+                
+                temp_pbp_list_23_24[[i]] <- pbp_data
+                
+        }
+        
+        pbp_2023_2024 <- bind_rows(temp_pbp_list_23_24) %>%
+                arrange(date, 
+                        game_id, 
+                        event_sort)
+        
+        saveRDS(pbp_2023_2024, "pbp_2023_2024.rds")
+        
+}
+
+
+if(!file.exists("pbp_2022_2023.rds")) {
+        
+        # Get PBP data for 2022-2023 season
+        
+        game_ids_2022_2023 <- schedule_2022_2023$game_id
+        
+        temp_pbp_list_22_23 <- list()
+        
+        for (i in 1:length(game_ids_2022_2023)) {
+                
+                pbp_data <- get_play_by_play_data(game_ids_2022_2023[i])
+                
+                temp_pbp_list_22_23[[i]] <- pbp_data
+                
+        }
+        
+        pbp_2022_2023 <- bind_rows(temp_pbp_list_22_23) %>%
+                arrange(date, 
+                        game_id, 
+                        event_sort)
+        
+        saveRDS(pbp_2022_2023, "pbp_2022_2023.rds")
+        
+}
+
+
+if(!file.exists("pbp_2021_2022.rds")) {
+        
+        # Get PBP data for 2021-2022 season
+        
+        game_ids_2021_2022 <- schedule_2021_2022$game_id
+        
+        temp_pbp_list_21_22 <- list()
+        
+        for (i in 1:length(game_ids_2021_2022)) {
+                
+                pbp_data <- get_play_by_play_data(game_ids_2021_2022[i])
+                
+                temp_pbp_list_21_22[[i]] <- pbp_data
+                
+        }
+        
+        pbp_2021_2022 <- bind_rows(temp_pbp_list_21_22) %>%
+                arrange(date, 
+                        game_id, 
+                        event_sort)
+        
+        saveRDS(pbp_2021_2022, "pbp_2021_2022.rds")
+        
+}
+
+
+if(!file.exists("pbp_2019_2020.rds")) {
+        
+        # Get PBP data for 2019_2020 season
+        
+        game_ids_2019_2020 <- schedule_2019_2020$game_id
+        
+        temp_pbp_list_19_20 <- list()
+        
+        for (i in 1:length(game_ids_2019_2020)) {
+                
+                pbp_data <- get_play_by_play_data(game_ids_2019_2020[i])
+                
+                temp_pbp_list_19_20[[i]] <- pbp_data
+                
+        }
+        
+        pbp_2019_2020 <- bind_rows(temp_pbp_list_19_20) %>%
+                arrange(date, 
+                        game_id, 
+                        event_sort)
+        
+        saveRDS(pbp_2019_2020, "pbp_2019_2020.rds")
+        
+}
+
+
+if(!file.exists("pbp_2018_2019.rds")) {
+        
+        # Get PBP data for 2018_2019 season
+        
+        game_ids_2018_2019 <- schedule_2018_2019$game_id
+        
+        temp_pbp_list_18_19 <- list()
+        
+        for (i in 1:length(game_ids_2018_2019)) {
+                
+                pbp_data <- get_play_by_play_data(game_ids_2018_2019[i])
+                
+                temp_pbp_list_18_19[[i]] <- pbp_data
+                
+        }
+        
+        pbp_2018_2019 <- bind_rows(temp_pbp_list_18_19) %>%
+                arrange(date, 
+                        game_id, 
+                        event_sort)
+        
+        saveRDS(pbp_2018_2019, "pbp_2018_2019.rds")
+        
+}
+
+
+if(!file.exists("pbp_2018_2019.rds")) {
+        
+        # Get PBP data for 2017_2018 season
+        
+        game_ids_2017_2018 <- schedule_2017_2018$game_id
+        
+        temp_pbp_list_17_18 <- list()
+        
+        for (i in 1:length(game_ids_2017_2018)) {
+                
+                pbp_data <- get_play_by_play_data(game_ids_2017_2018[i])
+                
+                temp_pbp_list_17_18[[i]] <- pbp_data
+                
+        }
+        
+        pbp_2017_2018 <- bind_rows(temp_pbp_list_17_18) %>%
+                arrange(date, 
+                        game_id, 
+                        event_sort)
+        
+        saveRDS(pbp_2017_2018, "pbp_2017_2018.rds")
+        
+}
+
+```
+
+## Join Play-By-Play Data
+
+```{r}
+
+pbp_data <- pbp_2017_2018 %>%
+        bind_rows(pbp_2018_2019,
+                  pbp_2019_2020,
+                  pbp_2021_2022,
+                  pbp_2022_2023,
+                  pbp_2023_2024) %>%
+        arrange(game_id,
+                date,
+                game_time_s)
+
+```
+
+## Build The xG Model
+
+### Add Temporary ID To PBP Data
+
+```{r}
+
+pbp_data <- pbp_data %>%
+        mutate(temp_id = row_number())
+
+```
+
+### Pre-Process The PBP Data
+
+This step filters the data for shots and goals (excluding empty nets and shootouts). It also adds several predictor variables:
+
+-   two prior events in the play-by-play data;
+
+-   zone for the immediately prior event in the play-by-play data;
+
+-   time elapsed since the immediately prior event in the play-by-play data;
+
+-   change on the y-axis after the immediately prior event in the play-by-play data;
+
+-   juicy rebounds; and
+
+-   penalty shots.
+
+The pre-processing steps are captured in a function that can be used for other applications.
+
+```{r}
+
+dsa_pp_function <- function(pbp_data) {
+        
+        # Add variables
+        
+        pbp_data_pp <- pbp_data %>%
+                mutate(lag_event = lag(event_type),
+                       lag_event_2 = lag(event_type, 2),
+                       lag_zone = lag(zone),
+                       lag_penalty_desc = substr(lag(penalty_description), 1, 2),
+                       elapsed_time = period_time_s - lag(period_time_s),
+                       y_diff = case_when(
+                               event_y >= 0 & lag(event_y >= 0) ~ abs(event_y - lag(event_y)), 
+                               event_y < 0 & lag(event_y < 0) ~ abs(event_y - lag(event_y)), 
+                               event_y >= 0 & lag(event_y) < 0 ~ event_y + abs(lag(event_y)), 
+                               event_y < 0 & lag(event_y) >=0 ~ abs(event_y) + lag(event_y)))
+        
+        # Perform some clean-up for NA values
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                mutate(shot_type = if_else(is.na(shot_type), "unknown", shot_type),
+                       lag_event = if_else(is.na(lag_event), "unknown", lag_event),
+                       lag_event_2 = if_else(is.na(lag_event_2), "unknown", lag_event_2),
+                       lag_zone = if_else(is.na(lag_zone), "unknown", lag_zone),
+                       elapsed_time = if_else(is.na(elapsed_time), 0, elapsed_time),
+                       y_diff = if_else(is.na(y_diff), 0, y_diff),
+                       lag_penalty_desc = if_else(is.na(lag_penalty_desc), "xx", lag_penalty_desc))
+        
+        # Add juicy_rebound variable (shot within 3 seconds with movement on the y-axis)
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                mutate(juicy_rebound = if_else(
+                        lag_event == "shot-on-goal" &
+                                y_diff >= 1 &
+                                elapsed_time < 4,
+                        TRUE,
+                        FALSE))
+        
+        # Add penalty_shot variable
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                mutate(penalty_shot = if_else(
+                        lag_penalty_desc == "ps",  
+                        TRUE,
+                        FALSE))
+        
+        # Shrink the data to capture shots (exclude empty nets and shootouts)
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                filter(event_type == "goal" | event_type == "shot-on-goal" | event_type == "missed-shot",
+                       event_on_en == "FALSE",
+                       period != 5) %>%
+                mutate(event_type = if_else(event_type == "goal", 
+                                            "goal", 
+                                            "shot-attempt"))
+        
+        # Convert some variables to factors
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                mutate(event_type = as.factor(event_type),
+                       period = as.factor(period),
+                       event_pp = as.factor(event_pp),
+                       event_sh = as.factor(event_sh),
+                       juicy_rebound = as.factor(juicy_rebound),
+                       penalty_shot = as.factor(penalty_shot))
+        
+        # Fix the shot angle on 0 distance shots
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                mutate(sa_angle = if_else(sa_distance == 0, 0, sa_angle)) 
+        
+        # Select model data
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                select(event_type,
+                       sa_distance,
+                       sa_angle,
+                       shot_type,
+                       period,
+                       event_pp,
+                       event_sh,
+                       lag_event,
+                       lag_event_2,
+                       lag_zone,
+                       elapsed_time,
+                       y_diff,
+                       juicy_rebound,
+                       penalty_shot,
+                       temp_id) 
+        
+        # Final clean-up
+        
+        pbp_data_pp <- pbp_data_pp %>%
+                filter(sa_distance >= 0,
+                       elapsed_time >= 0)
+        
+}
+
+pbp_data_pp <- dsa_pp_function(pbp_data)
+
+saveRDS(dsa_pp_function, "dsa_pp_function.rds")
+
+```
+
+### Split The Data
+
+Note: strata = event_type.
+
+```{r}
+
+set.seed(18)
+
+split_data <- initial_split(data = pbp_data_pp,
+                            strata = event_type)
+
+training_data <- training(split_data)
+testing_data <- testing(split_data)
+
+set.seed(18)
+
+data_folds <- vfold_cv(training_data,
+                       v = 10,
+                       strata = event_type)
+
+```
+
+### Explore Models
+
+Write multiple recipes for an XGBoost model.
+
+```{r}
+
+base_rec <- recipe(event_type ~ sa_distance +
+                           sa_angle +
+                           juicy_rebound,
+                   data = training_data) %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+shot_type_rec <- recipe(event_type ~ sa_distance +
+                                sa_angle +
+                                juicy_rebound +
+                                shot_type,
+                        data = training_data) %>%
+        step_other(shot_type, 
+                   threshold = 0.05) %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+special_teams_rec <- recipe(event_type ~ sa_distance +
+                                    sa_angle +
+                                    juicy_rebound +
+                                    event_pp +
+                                    event_sh,
+                            data = training_data) %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE) 
+
+lag_events_rec <- recipe(event_type ~ sa_distance +
+                                 sa_angle +
+                                 juicy_rebound +
+                                 lag_event +
+                                 lag_event_2 +
+                                 lag_zone,
+                         data = training_data) %>%
+        step_other(lag_event, 
+                   threshold = 0.05, 
+                   id = "le_id") %>%
+        step_other(lag_event_2, 
+                   threshold = 0.05, 
+                   id = "le2_id") %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+time_y_diff_rec <- recipe(event_type ~ sa_distance +
+                                  sa_angle +
+                                  juicy_rebound +
+                                  elapsed_time +
+                                  y_diff,
+                          data = training_data) %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+everything_rec <- recipe(event_type ~ .,
+                         data = training_data) %>%
+        step_rm(temp_id) %>%
+        step_other(shot_type, 
+                   threshold = 0.05) %>%
+        step_other(lag_event, 
+                   threshold = 0.05) %>%
+        step_other(lag_event_2, 
+                   threshold = 0.05) %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+interactions_rec <- recipe(event_type ~ .,
+                           data = training_data) %>%
+        step_rm(temp_id) %>%
+        step_other(shot_type, 
+                   threshold = 0.05) %>%
+        step_other(lag_event, 
+                   threshold = 0.05) %>%
+        step_other(lag_event_2, 
+                   threshold = 0.05) %>%
+        step_interact(terms = ~ sa_distance:sa_angle) %>%
+        step_interact(terms = ~ elapsed_time:y_diff) %>%
+        step_dummy(all_nominal_predictors(),
+                   one_hot = TRUE)
+
+```
+
+Fit the above recipes.
+
+```{r}
+
+rec_list <- list(base = base_rec,
+                 shot_type = shot_type_rec,
+                 special_teams = special_teams_rec,
+                 lag_events = lag_events_rec,
+                 time_y_diff = time_y_diff_rec,
+                 everything = everything_rec,
+                 interactions = interactions_rec)
+
+exploratory_models <- workflow_set(rec_list,
+                                   list(xgb = boost_tree(mode = "classification"))) %>%
+        workflow_map("fit_resamples",
+                     seed = 18,
+                     verbose = TRUE,
+                     resamples = data_folds)
+
+```
+
+Collect the metrics from all of the models.
+
+```{r}
+
+collect_metrics(exploratory_models) %>% 
+        filter(.metric == "roc_auc") %>% 
+        arrange(desc(mean)) %>% 
+        select(wflow_id, 
+               .metric,
+               mean,
+               std_err) %>%
+        mutate(mean = round(mean, 4),
+               std_err = round(std_err, 5))
+
+```
+
+The "interactions" model was slightly better than the "everything" model.
+
+Fit the "interactions" model using all of the training data and check the roc_auc.
+
+```{r}
+
+workflow() |>
+        add_model(boost_tree(mode = "classification")) %>%
+        add_recipe(interactions_rec) %>%
+        fit(data = training_data) %>%
+        augment(training_data) %>%
+        roc_auc(truth = event_type, .pred_goal) 
+
+```
+
+The roc_auc improved as should be expected. Now repeat that process on the testing data.
+
+```{r}
+
+workflow() |>
+        add_model(boost_tree(mode = "classification")) %>%
+        add_recipe(interactions_rec) %>%
+        fit(data = training_data) %>%
+        augment(testing_data) %>%
+        roc_auc(truth = event_type, .pred_goal) 
+
+```
+
+There's a small drop here but the model seems to do well enough when given new data.
+
+#### Importance Of Variables
+
+```{r}
+
+workflow() |>
+        add_model(boost_tree(mode = "classification")) %>%
+        add_recipe(interactions_rec) %>%
+        fit(data = training_data) %>%
+        extract_fit_parsnip() %>%
+        vip(num_features = 15) +
+        theme_minimal()
+
+```
+
+### Tuned Model
+
+Now tune a model using the "interactions" recipe.
+
+#### Define The Model For Tuning
+
+```{r}
+
+xgb_model_tuned <- boost_tree(trees = tune(),
+                              tree_depth = tune(),
+                              mtry = tune(),
+                              min_n = tune(),
+                              sample_size = tune()) %>%
+        set_engine("xgboost") %>%
+        set_mode("classification") 
+
+```
+
+#### Create A Workflow
+
+```{r}
+
+xgb_wflow_tuned <- workflow() %>%
+        add_model(xgb_model_tuned) %>%
+        add_recipe(interactions_rec)
+
+```
+
+#### Tune The Model
+
+Note: an iterative process was used to narrow the ranges for the tuning parameters.
+
+```{r}
+
+set.seed(18)
+
+tuning_grid <- grid_latin_hypercube(trees(range = c(500, 750)),
+                                    tree_depth(range = c(2,3)),
+                                    finalize(mtry(), training_data),
+                                    min_n(range = c(10, 30)),
+                                    sample_size = sample_prop(range = c(0.8, 0.95)),
+                                    size = 30)
+
+registerDoParallel()
+
+set.seed(18)
+
+xgb_tuned <- tune_race_anova(xgb_wflow_tuned,
+                             resamples = data_folds,
+                             grid = tuning_grid,
+                             metrics = metric_set(roc_auc),
+                             control = control_race(verbose_elim = TRUE))
+
+```
+
+Show the race.
+
+```{r}
+
+plot_race(xgb_tuned) +
+        theme_minimal()
+
+```
+
+Show the best tuning parameters.
+
+```{r}
+
+best_param <- show_best(xgb_tuned,
+                        metric = "roc_auc") %>%
+        select(-c(".estimator", "n", ".config"))
+
+best_param
+
+```
+
+#### Fit A Tuned Model
+
+```{r}
+
+tuned_best_param <- tibble(trees = best_param$trees[1],
+                           mtry = best_param$mtry[1],
+                           min_n = best_param$min_n[1],
+                           tree_depth = best_param$tree_depth[1],
+                           sample_size = best_param$sample_size[1])
+
+#tuned_best_param <- tibble(trees = 639,
+                           #mtry = 10,
+                           #min_n = 12,
+                           #tree_depth = 2,
+                           #sample_size = 0.9300455)
+
+xgb_wflow_tuned_final <- xgb_wflow_tuned %>%
+        finalize_workflow(tuned_best_param)
+
+xgb_fit_tuned <- xgb_wflow_tuned_final %>%
+        fit(training_data)
+
+```
+
+#### Check AUC With Training Data
+
+```{r}
+
+tuned_train_res <- augment(xgb_fit_tuned, training_data) %>%
+        roc_auc(event_type, .pred_goal) %>%
+        select(.estimate) %>%
+        rename(auc_tuned_training = .estimate)
+
+tuned_train_res 
+
+```
+
+There's a small improvement after tuning the parameters.
+
+#### Check AUC With Testing Data
+
+```{r}
+
+tuned_test_res <- predict(xgb_fit_tuned, 
+                          new_data = testing_data %>% select(-event_type),
+                          type = "prob")
+
+tuned_test_res <- bind_cols(tuned_test_res, 
+                            testing_data %>% select(event_type))
+
+tuned_auc <- roc_auc(tuned_test_res, event_type, .pred_goal)[3] %>%
+        rename(auc_tuned_testing = .estimate)
+
+tuned_auc
+
+```
+
+Another small improvement here.
+
+#### Actual v Predicted Goals
+
+```{r}
+
+tuned_a_v_p <- summarize(tuned_test_res,
+                         actual_goals = sum(event_type == "goal"),
+                         predicted_goals = sum(.pred_goal),
+                         diff = round(predicted_goals - actual_goals, 1),
+                         diff_perc = round((diff / actual_goals), 3) * 100)
+
+tuned_a_v_p
+
+```
+
+#### Importance of Variables
+
+```{r}
+
+extract_fit_parsnip(xgb_fit_tuned) %>%
+        vip(num_features = 15) +
+        theme_minimal()
+
+```
+
+## Save The Model
+
+```{r}
+
+xgb_fit_tuned |>
+        bundle() |>
+        saveRDS("dsa_model_2024.rds")
+
+# To load this model in another R session:
+
+#xg_model_2024 <- readRDS("xg_model_2024.rds") |>
+        #unbundle()
+
+# To simply save as .rds file:
+
+#saveRDS(xgb_fit_tuned, "xg_model_2024.rds")
+
+```
+
+## Explore The Test Results
+
+### Summary
+
+```{r}
+
+summary(tuned_test_res)
+
+```
+
+### Goals By DSA Value
+
+```{r}
+
+tuned_test_res %>% filter(event_type == "goal") %>% ggplot(aes(x = .pred_goal)) + geom_histogram(binwidth = 0.01) + labs(x = "DSA Value", y = "Goals") + theme_minimal()
+
+```
+
+### Goals By Quintile Summary
+
+```{r}
+
+tuned_test_res %>% mutate(qu = ntile(tuned_test_res$.pred_goal, n = 5)) %>% group_by(qu) %>% summarize(shot_attempts = n(), goals = sum(event_type == "goal"), perc_total = round((sum(event_type == "goal") / nrow(filter(tuned_test_res, event_type == "goal"))) * 100, 1), min_dsa = round(min(.pred_goal), 3), mdn_dsa = round(median(.pred_goal), 3), avg_dsa = round(mean(.pred_goal), 3), mdn_dsa = round(median(.pred_goal), 3))
+
+```
